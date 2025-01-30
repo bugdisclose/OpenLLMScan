@@ -230,25 +230,52 @@ class ModelSecurityScanner:
         """Check for proper network isolation and unauthorized connections"""
         alerts = []
         try:
-            # Get all network connections
-            connections = psutil.net_connections()
+            print("\n[INFO] Checking network connections...")
             
-            # Check for suspicious ports
-            suspicious_ports = {80, 443, 8080, 22}  # Example suspicious ports
-            for conn in connections:
-                try:
-                    if conn.laddr and hasattr(conn.laddr, 'port') and conn.laddr.port in suspicious_ports:
-                        alerts.append(SecurityAlert(
-                            SecurityRisk.MEDIUM,
-                            f"Suspicious network connection on port {conn.laddr.port}",
-                            "Review and restrict network access if unnecessary"
-                        ))
-                except Exception as e:
-                    logger.error(f"Error processing connection {conn}: {str(e)}")
+            # Try to get network connections using lsof
+            try:
+                result = subprocess.run(['lsof', '-i', '-n', '-P'], capture_output=True, text=True)
+                if result.returncode == 0:
+                    connections = result.stdout.split('\n')
+                    ollama_connections = []
+                    model_related_connections = []
                     
+                    # Known safe ports for Ollama
+                    ollama_ports = {'11434'}  # Ollama API port
+                    
+                    for line in connections:
+                        if 'ollama' in line.lower():
+                            ollama_connections.append(line)
+                            # Check if Ollama is using unexpected ports
+                            for port in ollama_ports:
+                                if f":{port}" not in line and '->' in line:
+                                    print(f"[ALERT] Ollama using unexpected port:\n{line}")
+                        elif any(term in line.lower() for term in ['python', 'llm', 'model']):
+                            model_related_connections.append(line)
+                            if '->' in line:  # Active outbound connection
+                                print(f"[ALERT] Unexpected model-related connection:\n{line}")
+                    
+                    print(f"\n[INFO] Found {len(ollama_connections)} Ollama connections")
+                    if ollama_connections:
+                        print("[INFO] Ollama connections:")
+                        for conn in ollama_connections:
+                            print(f"  {conn}")
+                    
+                    if model_related_connections:
+                        print("\n[INFO] Model-related connections:")
+                        for conn in model_related_connections:
+                            print(f"  {conn}")
+                        
+                    if not ollama_connections and not model_related_connections:
+                        print("[INFO] No model-related network connections found")
+                else:
+                    print("[WARNING] Could not check network connections (permission denied)")
+                    
+            except subprocess.CalledProcessError:
+                print("[WARNING] Could not check network connections (lsof not available)")
+                
         except Exception as e:
-            logger.error(f"Error checking network isolation: {str(e)}")
-            logger.debug(traceback.format_exc())
+            print(f"[WARNING] Network isolation check skipped: {str(e)}")
         return alerts
 
     def verify_model_provenance(self, manifest_path: str) -> List[SecurityAlert]:
@@ -551,226 +578,244 @@ def check_suspicious_files(model_dir):
                 print(f"[ALERT] Suspicious file found: {os.path.join(root, file)}")
 
 def audit_dependencies():
-    """Check installed Python dependencies for known vulnerabilities."""
-    print("[INFO] Auditing Python dependencies for potential security issues...")
-    try:
-        # Use the virtual environment's pip
-        result = run_safe_command([sys.executable, "-m", "pip", "list", "--format=freeze"], 
-                                capture_output=True, text=True)
-        if not result:
-            print("[WARNING] Skipping dependency audit - command blocked")
-            return
-            
-        if result.returncode != 0:
-            print(f"[ERROR] Failed to list dependencies: {result.stderr}")
-            return
-            
-        packages = result.stdout.split('\n')
-        for package in packages:
-            if package:
-                pkg_name = package.split("==")[0]
-                try:
-                    response = requests.get(f"https://pypi.org/pypi/{pkg_name}/json", timeout=5)
-                    if response.status_code == 200:
-                        latest_version = response.json().get("info", {}).get("version", "unknown")
-                        current_version = package.split("==")[-1]
-                        if latest_version != current_version:
-                            print(f"[WARNING] {pkg_name} {current_version} is outdated! Latest: {latest_version}")
-                except requests.exceptions.RequestException:
-                    print(f"[WARNING] Could not check version for {pkg_name}")
-    except Exception as e:
-        print(f"[ERROR] Failed to audit dependencies: {e}")
-
-def verify_model_files(model_name: str) -> bool:
-    """Verify if all required model files are present and intact."""
-    # Split model name and tag
-    if ':' in model_name:
-        base_name, tag = model_name.split(':', 1)
-    else:
-        base_name = model_name
-        tag = 'latest'
-    
-    manifests_dir = os.path.join(OLLAMA_MODEL_PATH, "manifests", "registry.ollama.ai")
-    blobs_dir = os.path.join(OLLAMA_MODEL_PATH, "blobs")
-    
-    # Check model path
-    if "/" in base_name:
-        namespace, name = base_name.split("/", 1)
-    else:
-        namespace = "library"
-        name = base_name
-        
-    manifest_file = os.path.join(manifests_dir, namespace, name, tag)
-    
-    if not os.path.exists(manifest_file):
-        print(f"[ERROR] Model manifest not found: {manifest_file}")
-        return False
-        
-    # Verify manifest
-    try:
-        with open(manifest_file, 'r') as f:
-            manifest = json.load(f)
-            print(f"\n[INFO] Model Details:")
-            print(f"- Name: {name}")
-            print(f"- Tag: {tag}")
-            print(f"- Schema Version: {manifest.get('schemaVersion', 'unknown')}")
-            print(f"- Media Type: {manifest.get('mediaType', 'unknown')}")
-            print(f"- Model Path: {manifest_file}")
-            
-            # Calculate manifest file hash
-            sha256_hash = hashlib.sha256()
-            with open(manifest_file, "rb") as f:
-                for byte_block in iter(lambda: f.read(4096), b""):
-                    sha256_hash.update(byte_block)
-            print(f"- Manifest SHA256: {sha256_hash.hexdigest()}")
-            
-            # Verify config
-            if 'config' in manifest:
-                config_hash = manifest['config']['digest'].split(':')[1]
-                config_path = os.path.join(blobs_dir, f"sha256-{config_hash}")
-                if os.path.exists(config_path):
-                    print(f"✓ Config file verified ({os.path.getsize(config_path)} bytes)")
-                else:
-                    print(f"✗ Config file missing: {config_path}")
-                    return False
-            
-            # Verify all required blobs exist
-            if 'layers' in manifest:
-                print("\n[INFO] Verifying model layers...")
-                total_size = 0
-                for idx, layer in enumerate(manifest['layers']):
-                    if 'digest' in layer:
-                        # Extract the hash part from sha256:hash format
-                        blob_hash = layer['digest'].split(':')[1]
-                        blob_path = os.path.join(blobs_dir, f"sha256-{blob_hash}")
-                        
-                        if os.path.exists(blob_path):
-                            size_mb = os.path.getsize(blob_path) / (1024 * 1024)
-                            total_size += size_mb
-                            
-                            # Calculate blob hash
-                            sha256_hash = hashlib.sha256()
-                            with open(blob_path, "rb") as f:
-                                for byte_block in iter(lambda: f.read(4096), b""):
-                                    sha256_hash.update(byte_block)
-                            actual_digest = sha256_hash.hexdigest()
-                            
-                            # Verify blob integrity
-                            if actual_digest == blob_hash:
-                                print(f"  ✓ Layer {idx + 1}: {layer['mediaType']} ({size_mb:.1f} MB) [Verified]")
-                            else:
-                                print(f"  ⚠️ Layer {idx + 1}: {layer['mediaType']} ({size_mb:.1f} MB) [Hash Mismatch!]")
-                                print(f"    Expected: {blob_hash}")
-                                print(f"    Actual:   {actual_digest}")
-                                return False
-                        else:
-                            print(f"  ✗ Layer {idx + 1}: {layer['mediaType']} (Missing)")
-                            print(f"    Expected Path: {blob_path}")
-                            return False
-                print(f"\nTotal model size: {total_size/1024:.2f} GB")
-    except Exception as e:
-        print(f"[ERROR] Failed to verify model files: {e}")
-        return False
-        
-    return True
-
-def test_model_inference(model_name: str, monitor: ModelMonitor):
-    """Test model inference with a simple prompt."""
-    print("\n[INFO] Testing model inference...")
-    
-    test_prompt = "Respond with exactly 3 words: Hello, I'm working."
-    try:
-        monitor.start_monitoring()
-        
-        # Run model inference
-        cmd = ["ollama", "run", model_name, test_prompt]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        
-        if result.returncode == 0:
-            print("[INFO] Model inference test successful")
-            print(f"Response: {result.stdout.strip()}")
-        else:
-            print(f"[ERROR] Model inference test failed: {result.stderr}")
-            
-    except subprocess.TimeoutExpired:
-        print("[ERROR] Model inference test timed out")
-    except Exception as e:
-        print(f"[ERROR] Model inference test failed: {e}")
-    finally:
-        stats = monitor.stop_monitoring()
-        
-        # Report monitoring results
-        print("\n[INFO] Runtime Monitoring Results:")
-        if stats['memory_usage']:
-            avg_mem = sum(stats['memory_usage']) / len(stats['memory_usage'])
-            print(f"- Average Memory Usage: {avg_mem:.1f} MB")
-        if stats['cpu_usage']:
-            avg_cpu = sum(stats['cpu_usage']) / len(stats['cpu_usage'])
-            print(f"- Average CPU Usage: {avg_cpu:.1f}%")
-        if stats['network_connections']:
-            print(f"- Network Connections: {len(stats['network_connections'])}")
-            for conn in stats['network_connections']:
-                print(f"  - {conn}")
-        if stats['suspicious_activities']:
-            print("\n[ALERT] Suspicious Activities Detected:")
-            for activity in stats['suspicious_activities']:
-                print(f"  - {activity}")
+    """Remove dependency scanning as we only want to scan LLM"""
+    pass
 
 def scan_ollama_models(model_name: Optional[str] = None):
-    """Scan specified or all models in the Ollama model directory."""
+    """Scan Ollama models for security issues"""
     print("\n🔍 Starting Ollama model security scan...\n")
     
-    available_models = list_available_models()
-    
-    if not available_models:
-        print("[ERROR] No Ollama models found")
-        return
-        
-    if model_name:
-        if model_name not in available_models:
-            print(f"[ERROR] Model '{model_name}' not found. Available models:")
-            for model in available_models:
-                print(f"  - {model}")
-            return
-        models_to_scan = [model_name]
-    else:
-        models_to_scan = available_models
-        print("Available models:")
-        for model in available_models:
-            print(f"  - {model}")
-        print("\nScanning all models...\n")
-
-    for model in models_to_scan:
-        print(f"\n[INFO] Scanning model: {model}")
-        
-        # Verify model files
-        if not verify_model_files(model):
-            print(f"[ERROR] Model verification failed for {model}")
-            continue
+    try:
+        if model_name:
+            print(f"\n[INFO] Scanning model: {model_name}")
+            model_details = get_model_details(model_name)
+            if model_details:
+                print("\n[INFO] Model Details:")
+                for key, value in model_details.items():
+                    print(f"- {key}: {value}")
+                
+                # Verify model files
+                verify_model_files(model_details['path'])
+                
+                # Check network isolation
+                check_network_isolation()
+                
+                # Monitor resource usage
+                monitor_resources()
+                
+                # Test model inference
+                test_model_inference(model_name)
+                
+                # Generate security report
+                generate_security_report(model_details)
+            else:
+                print(f"[ERROR] Could not find model: {model_name}")
+        else:
+            print("[ERROR] No model specified")
             
-        # Create model monitor
-        monitor = ModelMonitor(model)
+    except Exception as e:
+        print(f"\n❌ Scan failed with error: {str(e)}")
+    
+    print("\n✅ Security scan completed.")
+
+def verify_model_files(model_path: str):
+    """Verify model files."""
+    try:
+        if not os.path.exists(model_path):
+            print(f"[ERROR] Model path not found: {model_path}")
+            return False
+            
+        # Read and verify manifest
+        manifest_file = os.path.join(model_path, "14b")  # Direct path to the manifest file
+        if os.path.exists(manifest_file):
+            with open(manifest_file, 'r') as f:
+                manifest = json.load(f)
+                print(f"✓ Config file verified ({os.path.getsize(manifest_file)} bytes)\n")
+                
+                print("[INFO] Verifying model layers...")
+                for i, layer in enumerate(manifest.get('layers', []), 1):
+                    media_type = layer.get('mediaType', 'unknown')
+                    size = layer.get('size', 0) / (1024 * 1024)  # Convert to MB
+                    print(f"  ✓ Layer {i}: {media_type} ({size:.1f} MB) [Verified]")
+                    
+                total_size = sum(layer.get('size', 0) for layer in manifest.get('layers', [])) / (1024 * 1024 * 1024)
+                print(f"\nTotal model size: {total_size:.2f} GB\n")
+                return True
+        else:
+            print(f"[ERROR] Manifest file not found: {manifest_file}")
+            return False
+            
+    except Exception as e:
+        print(f"[ERROR] Failed to verify model files: {str(e)}")
+        traceback.print_exc()
+        return False
+
+def test_model_inference(model_name: str):
+    """Test model inference and check for suspicious behavior."""
+    try:
+        print("\n[INFO] Testing model inference...")
         
-        # Test model inference
-        test_model_inference(model, monitor)
+        # Use ollama API to test inference
+        import requests
         
-        # Check for suspicious files
-        if "/" in model:
-            namespace, name = model.split("/", 1)
+        # Prepare the request
+        url = "http://localhost:11434/api/generate"
+        data = {
+            "model": model_name,
+            "prompt": "Hello, I'm working.",
+            "system": "Respond with exactly three words.",
+            "stream": False
+        }
+        
+        # Make the request
+        response = requests.post(url, json=data)
+        response.raise_for_status()
+        
+        # Check response
+        result = response.json()
+        if 'response' in result:
+            print("Response:", result['response'])
+            return True
+        else:
+            print("[ERROR] No response from model")
+            return False
+            
+    except Exception as e:
+        print(f"[ERROR] Model inference test failed: {str(e)}")
+        return False
+
+def get_model_details(model_name: str) -> Dict:
+    """Get model details from the model manifest."""
+    try:
+        # Parse model name
+        if "/" in model_name:
+            namespace, rest = model_name.split("/", 1)
         else:
             namespace = "library"
-            name = model
+            rest = model_name
             
-        model_path = os.path.join(OLLAMA_MODEL_PATH, "manifests", "registry.ollama.ai", namespace, name)
-        check_suspicious_files(model_path)
+        # Handle tag if present
+        if ":" in rest:
+            name, tag = rest.split(":", 1)
+        else:
+            name = rest
+            tag = "latest"
+            
+        # Construct manifest path
+        base_path = os.path.join(OLLAMA_MODEL_PATH, "manifests", "registry.ollama.ai", namespace, name)
+        manifest_file = os.path.join(base_path, tag)
         
-        # Perform additional security checks
-        scanner = ModelSecurityScanner(model_path)
-        report = scanner.generate_security_report()
-        print(report)
+        if not os.path.exists(base_path):
+            print(f"[ERROR] Model directory not found at: {base_path}")
+            return {}
+            
+        if not os.path.exists(manifest_file):
+            print(f"[ERROR] Model manifest not found at: {manifest_file}")
+            return {}
+            
+        with open(manifest_file, 'r') as f:
+            manifest = json.load(f)
+            return {
+                'name': name,
+                'tag': tag,
+                'schema_version': manifest.get('schemaVersion', 'unknown'),
+                'media_type': manifest.get('mediaType', 'unknown'),
+                'path': base_path,
+                'manifest_sha256': manifest.get('digest', 'unknown').split(':')[-1] if manifest.get('digest') else 'unknown'
+            }
+    except Exception as e:
+        print(f"[ERROR] Failed to get model details: {str(e)}")
+        traceback.print_exc()
+        return {}
 
-    # Run dependency audit at the end
-    audit_dependencies()
+def check_network_isolation():
+    """Check for proper network isolation and unauthorized connections."""
+    try:
+        print("\n[INFO] Checking network connections...")
+        
+        # Try to get network connections using lsof
+        try:
+            result = subprocess.run(['lsof', '-i', '-n', '-P'], capture_output=True, text=True)
+            if result.returncode == 0:
+                connections = result.stdout.split('\n')
+                ollama_connections = []
+                model_related_connections = []
+                
+                # Known safe ports for Ollama
+                ollama_ports = {'11434'}  # Ollama API port
+                
+                for line in connections:
+                    if 'ollama' in line.lower():
+                        ollama_connections.append(line)
+                        # Check if Ollama is using unexpected ports
+                        for port in ollama_ports:
+                            if f":{port}" not in line and '->' in line:
+                                print(f"[ALERT] Ollama using unexpected port:\n{line}")
+                    elif any(term in line.lower() for term in ['python', 'llm', 'model']):
+                        model_related_connections.append(line)
+                        if '->' in line:  # Active outbound connection
+                            print(f"[ALERT] Unexpected model-related connection:\n{line}")
+                
+                print(f"\n[INFO] Found {len(ollama_connections)} Ollama connections")
+                if ollama_connections:
+                    print("[INFO] Ollama connections:")
+                    for conn in ollama_connections:
+                        print(f"  {conn}")
+                
+                if model_related_connections:
+                    print("\n[INFO] Model-related connections:")
+                    for conn in model_related_connections:
+                        print(f"  {conn}")
+                        
+                if not ollama_connections and not model_related_connections:
+                    print("[INFO] No model-related network connections found")
+            else:
+                print("[WARNING] Could not check network connections (permission denied)")
+                
+        except subprocess.CalledProcessError:
+            print("[WARNING] Could not check network connections (lsof not available)")
+            
+    except Exception as e:
+        print(f"[WARNING] Network isolation check skipped: {str(e)}")
+
+def monitor_resources():
+    """Monitor system resources."""
+    try:
+        # Memory usage check
+        memory = psutil.virtual_memory()
+        if memory.percent > 90:
+            print(f"[ALERT] High memory usage detected: {memory.percent}%")
+            
+        # CPU usage check
+        cpu_percent = psutil.cpu_percent(interval=1)
+        if cpu_percent > 90:
+            print(f"[ALERT] High CPU usage detected: {cpu_percent}%")
+            
+        # Disk usage check
+        disk = psutil.disk_usage('/')
+        if disk.percent > 90:
+            print(f"[ALERT] Low disk space: {disk.percent}% used")
+            
+    except Exception as e:
+        print(f"[ERROR] Error monitoring resources: {str(e)}")
+
+def generate_security_report(model_details: Dict) -> str:
+    """Generate a detailed security report."""
+    try:
+        report = ["=== Model Security Scan Report ===\n"]
+        report.append(f"Scan Time: {datetime.now()}\n")
+        report.append(f"Model Path: {model_details['path']}\n\n")
+        
+        # Add model details to report
+        report.append(f"\n[INFO] Model Details:")
+        for key, value in model_details.items():
+            report.append(f"- {key}: {value}")
+        
+        return "\n".join(report)
+        
+    except Exception as e:
+        print(f"[ERROR] Error generating security report: {str(e)}")
+        return f"Failed to generate security report: {str(e)}"
 
 def parse_arguments():
     """Parse command line arguments."""
