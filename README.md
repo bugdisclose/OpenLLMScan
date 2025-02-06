@@ -33,12 +33,6 @@ A quick scan script to gather security insights for your locally running LLMs.
 - Disk I/O analysis
 - Resource limit enforcement
 
-### 5. Dependency Management
-- Python package security audit
-- Version compatibility checks
-- Automatic dependency updates
-- CVE vulnerability scanning
-
 ## Installation
 
 ```bash
